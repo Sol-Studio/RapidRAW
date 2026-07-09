@@ -176,7 +176,34 @@ struct AllAdjustments {
     tile_offset_x: u32,
     tile_offset_y: u32,
     mask_atlas_cols: u32,
+    enabled_ops: u32,
+    pass_flags: u32,
+    full_width: u32,
+    full_height: u32,
 }
+
+// Operation enable flags for the multi-pass node pipeline.
+// Mirrored by image_processing::op_flags on the Rust side.
+const OP_EXPOSURE: u32 = 1u;
+const OP_BRIGHTNESS: u32 = 2u;
+const OP_CONTRAST: u32 = 4u;
+const OP_TONE: u32 = 8u;
+const OP_WHITE_BALANCE: u32 = 16u;
+const OP_SATURATION: u32 = 32u;
+const OP_VIBRANCE: u32 = 64u;
+const OP_HUE: u32 = 128u;
+const OP_CURVES: u32 = 256u;
+const OP_HSL: u32 = 512u;
+const OP_COLOR_GRADING: u32 = 1024u;
+const OP_COLOR_CALIBRATION: u32 = 2048u;
+const OP_DETAILS: u32 = 4096u;
+const OP_DEHAZE: u32 = 8192u;
+const OP_EFFECTS: u32 = 16384u;
+const OP_LUT: u32 = 32768u;
+const OP_CHROMATIC_ABERRATION: u32 = 65536u;
+
+const PASS_FIRST: u32 = 1u;
+const PASS_FINAL: u32 = 2u;
 
 struct HslRange {
     center: f32,
@@ -212,6 +239,16 @@ const HSL_RANGES: array<HslRange, 8> = array<HslRange, 8>(
 @group(0) @binding(11) var flare_sampler: sampler;
 
 const LUMA_COEFF = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// Real dimensions of the image data in the input texture. Intermediate passes of
+// the node pipeline read from an oversized reusable texture, so the actual size is
+// passed through the uniform; 0 falls back to the texture's own dimensions.
+fn effective_full_dims() -> vec2<f32> {
+    if (adjustments.full_width > 0u) {
+        return vec2<f32>(f32(adjustments.full_width), f32(adjustments.full_height));
+    }
+    return vec2<f32>(textureDimensions(input_texture));
+}
 
 fn get_luma(c: vec3<f32>) -> f32 {
     return dot(c, LUMA_COEFF);
@@ -789,7 +826,7 @@ fn apply_centre_local_contrast(
     if (centre_amount == 0.0) {
         return color_in;
     }
-    let full_dims_f = vec2<f32>(textureDimensions(input_texture));
+    let full_dims_f = effective_full_dims();
     let coord_f = vec2<f32>(coords_i);
     let midpoint = 0.4;
     let feather = 0.375;
@@ -818,7 +855,7 @@ fn apply_centre_tonal_and_color(
     if (centre_amount == 0.0) {
         return color_in;
     }
-    let full_dims_f = vec2<f32>(textureDimensions(input_texture));
+    let full_dims_f = effective_full_dims();
     let coord_f = vec2<f32>(coords_i);
     let midpoint = 0.4;
     let feather = 0.375;
@@ -902,7 +939,7 @@ fn apply_noise_reduction(
         return center_linear;
     }
 
-    let dims = vec2<i32>(textureDimensions(input_texture));
+    let dims = vec2<i32>(effective_full_dims());
     let max_idx = dims - vec2<i32>(1);
     let center_safe   = max(center_linear, vec3<f32>(0.0));
     let center_luma   = get_luma(center_safe);
@@ -1077,7 +1114,7 @@ fn apply_noise_reduction(
 }
 
 fn apply_ca_correction(coords: vec2<u32>, ca_rc: f32, ca_by: f32) -> vec3<f32> {
-    let dims = vec2<f32>(textureDimensions(input_texture));
+    let dims = effective_full_dims();
     let center = dims / 2.0;
     let current_pos = vec2<f32>(coords);
 
@@ -1442,8 +1479,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let out_dims = vec2<u32>(textureDimensions(output_texture));
     if (id.x >= out_dims.x || id.y >= out_dims.y) { return; }
 
+    // Per-pass operation gating: 0 means "everything enabled" so that callers
+    // predating the node pipeline (and zeroed default structs) keep working.
+    var ops = adjustments.enabled_ops;
+    if (ops == 0u) { ops = 0xFFFFFFFFu; }
+    var pass_flags = adjustments.pass_flags;
+    if (pass_flags == 0u) { pass_flags = PASS_FIRST | PASS_FINAL; }
+    let is_final_pass = (pass_flags & PASS_FINAL) != 0u;
+
     const REFERENCE_DIMENSION: f32 = 1080.0;
-    let full_dims = vec2<f32>(textureDimensions(input_texture));
+    // Intermediate node-pipeline passes read from an oversized reusable texture,
+    // so the real image dimensions are provided through the uniform instead.
+    let full_dims = effective_full_dims();
     let current_ref_dim = min(full_dims.x, full_dims.y);
     let scale = max(0.1, current_ref_dim / REFERENCE_DIMENSION);
 
@@ -1453,7 +1500,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let ca_rc = adjustments.global.chromatic_aberration_red_cyan;
     let ca_by = adjustments.global.chromatic_aberration_blue_yellow;
     var color_from_texture = textureLoad(input_texture, absolute_coord, 0).rgb;
-    if (abs(ca_rc) > 0.000001 || abs(ca_by) > 0.000001) {
+    if ((ops & OP_CHROMATIC_ABERRATION) != 0u && (abs(ca_rc) > 0.000001 || abs(ca_by) > 0.000001)) {
         color_from_texture = apply_ca_correction(absolute_coord, ca_rc, ca_by);
     }
     let original_alpha = textureLoad(input_texture, absolute_coord, 0).a;
@@ -1537,6 +1584,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // Zero out every parameter whose operation is not enabled for this pass, so
+    // the corresponding processing functions become identity transforms.
+    var t_centre = adjustments.global.centre;
+    if ((ops & OP_EXPOSURE) == 0u) { t_exposure = 0.0; }
+    if ((ops & OP_BRIGHTNESS) == 0u) { t_brightness = 0.0; }
+    if ((ops & OP_CONTRAST) == 0u) { t_contrast = 0.0; }
+    if ((ops & OP_TONE) == 0u) {
+        t_highlights = 0.0;
+        t_shadows = 0.0;
+        t_whites = 0.0;
+        t_blacks = 0.0;
+    }
+    if ((ops & OP_WHITE_BALANCE) == 0u) {
+        t_temperature = 0.0;
+        t_tint = 0.0;
+    }
+    if ((ops & OP_SATURATION) == 0u) { t_saturation = 0.0; }
+    if ((ops & OP_VIBRANCE) == 0u) { t_vibrance = 0.0; }
+    if ((ops & OP_HUE) == 0u) { t_hue = 0.0; }
+    if ((ops & OP_DETAILS) == 0u) {
+        t_sharpness = 0.0;
+        t_clarity = 0.0;
+        t_structure = 0.0;
+        t_luma_nr = 0.0;
+        t_color_nr = 0.0;
+        t_centre = 0.0;
+    }
+    if ((ops & OP_DEHAZE) == 0u) { t_dehaze = 0.0; }
+    if ((ops & OP_EFFECTS) == 0u) {
+        t_glow = 0.0;
+        t_halation = 0.0;
+        t_flare = 0.0;
+    }
+
     let final_hsl = array<HslColor, 8>(
         HslColor(h0_h, h0_s, h0_l, 0.0), HslColor(h1_h, h1_s, h1_l, 0.0),
         HslColor(h2_h, h2_s, h2_l, 0.0), HslColor(h3_h, h3_s, h3_l, 0.0),
@@ -1561,25 +1642,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         t_sharpness, is_raw, 0u, adjustments.global.sharpness_threshold
     );
 
-    var sharpness_delta = vec3<f32>(0.0);
-    for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
-        let influence = get_mask_influence(i, absolute_coord);
-        if (influence > 0.001) {
-            let m = adjustments.mask_adjustments[i];
-            if (abs(m.sharpness) > 0.001) {
-                let local_sharp_result = apply_local_contrast(
-                    initial_linear_rgb, sharpness_blurred,
-                    m.sharpness, is_raw, 0u, m.sharpness_threshold
-                );
-                sharpness_delta += (local_sharp_result - initial_linear_rgb) * influence;
+    if ((ops & OP_DETAILS) != 0u) {
+        var sharpness_delta = vec3<f32>(0.0);
+        for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
+            let influence = get_mask_influence(i, absolute_coord);
+            if (influence > 0.001) {
+                let m = adjustments.mask_adjustments[i];
+                if (abs(m.sharpness) > 0.001) {
+                    let local_sharp_result = apply_local_contrast(
+                        initial_linear_rgb, sharpness_blurred,
+                        m.sharpness, is_raw, 0u, m.sharpness_threshold
+                    );
+                    sharpness_delta += (local_sharp_result - initial_linear_rgb) * influence;
+                }
             }
         }
+        locally_contrasted_rgb += sharpness_delta;
     }
-    locally_contrasted_rgb += sharpness_delta;
 
     locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, clarity_blurred, t_clarity, is_raw, 1u, 0.0);
     locally_contrasted_rgb = apply_local_contrast(locally_contrasted_rgb, structure_blurred, t_structure, is_raw, 1u, 0.0);
-    locally_contrasted_rgb = apply_centre_local_contrast(locally_contrasted_rgb, adjustments.global.centre, absolute_coord_i, clarity_blurred, is_raw);
+    locally_contrasted_rgb = apply_centre_local_contrast(locally_contrasted_rgb, t_centre, absolute_coord_i, clarity_blurred, is_raw);
 
     var processed_rgb = apply_linear_exposure(locally_contrasted_rgb, t_exposure);
 
@@ -1612,40 +1695,46 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     var composite_rgb_linear = apply_dehaze(processed_rgb, structure_blurred, is_raw, t_dehaze);
-    composite_rgb_linear = apply_centre_tonal_and_color(composite_rgb_linear, adjustments.global.centre, absolute_coord_i);
+    composite_rgb_linear = apply_centre_tonal_and_color(composite_rgb_linear, t_centre, absolute_coord_i);
     composite_rgb_linear = apply_white_balance(composite_rgb_linear, t_temperature, t_tint);
     composite_rgb_linear = apply_filmic_exposure(composite_rgb_linear, t_brightness);
     composite_rgb_linear = apply_tonal_adjustments(composite_rgb_linear, tonal_blurred, is_raw, t_contrast, t_shadows, t_whites, t_blacks);
     composite_rgb_linear = apply_highlights_adjustment(composite_rgb_linear, tonal_blurred, is_raw, t_highlights);
-    composite_rgb_linear = apply_color_calibration(composite_rgb_linear, adjustments.global.color_calibration);
-    composite_rgb_linear = apply_hsl_panel(composite_rgb_linear, final_hsl, absolute_coord_i);
+    if ((ops & OP_COLOR_CALIBRATION) != 0u) {
+        composite_rgb_linear = apply_color_calibration(composite_rgb_linear, adjustments.global.color_calibration);
+    }
+    if ((ops & OP_HSL) != 0u) {
+        composite_rgb_linear = apply_hsl_panel(composite_rgb_linear, final_hsl, absolute_coord_i);
+    }
     composite_rgb_linear = apply_hue_shift(composite_rgb_linear, t_hue);
     composite_rgb_linear = apply_creative_color(composite_rgb_linear, t_saturation, t_vibrance);
 
-    composite_rgb_linear = apply_color_grading(
-        composite_rgb_linear,
-        adjustments.global.color_grading_shadows,
-        adjustments.global.color_grading_midtones,
-        adjustments.global.color_grading_highlights,
-        adjustments.global.color_grading_global,
-        adjustments.global.color_grading_blending,
-        adjustments.global.color_grading_balance
-    );
+    if ((ops & OP_COLOR_GRADING) != 0u) {
+        composite_rgb_linear = apply_color_grading(
+            composite_rgb_linear,
+            adjustments.global.color_grading_shadows,
+            adjustments.global.color_grading_midtones,
+            adjustments.global.color_grading_highlights,
+            adjustments.global.color_grading_global,
+            adjustments.global.color_grading_blending,
+            adjustments.global.color_grading_balance
+        );
 
-    for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
-        let influence = get_mask_influence(i, absolute_coord);
-        if (influence > 0.001) {
-            let m = adjustments.mask_adjustments[i];
-            let mask_graded = apply_color_grading(
-                composite_rgb_linear,
-                m.color_grading_shadows, m.color_grading_midtones, m.color_grading_highlights, m.color_grading_global, m.color_grading_blending, m.color_grading_balance
-            );
-            composite_rgb_linear = mix(composite_rgb_linear, mask_graded, influence);
+        for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
+            let influence = get_mask_influence(i, absolute_coord);
+            if (influence > 0.001) {
+                let m = adjustments.mask_adjustments[i];
+                let mask_graded = apply_color_grading(
+                    composite_rgb_linear,
+                    m.color_grading_shadows, m.color_grading_midtones, m.color_grading_highlights, m.color_grading_global, m.color_grading_blending, m.color_grading_balance
+                );
+                composite_rgb_linear = mix(composite_rgb_linear, mask_graded, influence);
+            }
         }
     }
 
-    if (adjustments.global.vignette_amount != 0.0) {
-        let full_dims_f = vec2<f32>(textureDimensions(input_texture));
+    if ((ops & OP_EFFECTS) != 0u && adjustments.global.vignette_amount != 0.0) {
+        let full_dims_f = full_dims;
         let coord_f = vec2<f32>(absolute_coord);
         let v_amount = adjustments.global.vignette_amount;
         let v_mid = adjustments.global.vignette_midpoint;
@@ -1677,33 +1766,36 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         base_srgb = linear_to_srgb(composite_rgb_linear);
     }
 
-    var final_rgb = apply_all_curves(base_srgb,
-        adjustments.global.luma_curve, adjustments.global.luma_curve_count,
-        adjustments.global.red_curve, adjustments.global.red_curve_count,
-        adjustments.global.green_curve, adjustments.global.green_curve_count,
-        adjustments.global.blue_curve, adjustments.global.blue_curve_count
-    );
+    var final_rgb = base_srgb;
+    if ((ops & OP_CURVES) != 0u) {
+        final_rgb = apply_all_curves(base_srgb,
+            adjustments.global.luma_curve, adjustments.global.luma_curve_count,
+            adjustments.global.red_curve, adjustments.global.red_curve_count,
+            adjustments.global.green_curve, adjustments.global.green_curve_count,
+            adjustments.global.blue_curve, adjustments.global.blue_curve_count
+        );
 
-    for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
-        let influence = get_mask_influence(i, absolute_coord);
-        if (influence > 0.001) {
-            let m = adjustments.mask_adjustments[i];
-            let mask_curved_srgb = apply_all_curves(final_rgb,
-                m.luma_curve, m.luma_curve_count,
-                m.red_curve, m.red_curve_count,
-                m.green_curve, m.green_curve_count,
-                m.blue_curve, m.blue_curve_count
-            );
-            final_rgb = mix(final_rgb, mask_curved_srgb, influence);
+        for (var i = 0u; i < adjustments.mask_count; i = i + 1u) {
+            let influence = get_mask_influence(i, absolute_coord);
+            if (influence > 0.001) {
+                let m = adjustments.mask_adjustments[i];
+                let mask_curved_srgb = apply_all_curves(final_rgb,
+                    m.luma_curve, m.luma_curve_count,
+                    m.red_curve, m.red_curve_count,
+                    m.green_curve, m.green_curve_count,
+                    m.blue_curve, m.blue_curve_count
+                );
+                final_rgb = mix(final_rgb, mask_curved_srgb, influence);
+            }
         }
     }
 
-    if (adjustments.global.has_lut == 1u) {
+    if ((ops & OP_LUT) != 0u && adjustments.global.has_lut == 1u) {
         let lut_color = sample_lut_tetrahedral(final_rgb);
         final_rgb = mix(final_rgb, lut_color, adjustments.global.lut_intensity);
     }
 
-    if (adjustments.global.grain_amount > 0.0) {
+    if ((ops & OP_EFFECTS) != 0u && adjustments.global.grain_amount > 0.0) {
         let coord = vec2<f32>(absolute_coord_i);
         let amount = adjustments.global.grain_amount * 0.5;
         let grain_frequency = (1.0 / max(adjustments.global.grain_size, 0.1)) / scale;
@@ -1718,7 +1810,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         final_rgb += vec3<f32>(noise_val) * amount * luma_mask;
     }
 
-    if (adjustments.global.show_clipping == 1u) {
+    if (is_final_pass && adjustments.global.show_clipping == 1u) {
         let HIGHLIGHT_WARNING_COLOR = vec3<f32>(1.0, 0.0, 0.0);
         let SHADOW_WARNING_COLOR = vec3<f32>(0.0, 0.0, 1.0);
         let HIGHLIGHT_CLIP_THRESHOLD = 0.998;
@@ -1730,8 +1822,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    let dither_amount = 1.0 / 255.0;
-    final_rgb += dither(id.xy) * dither_amount;
+    // Dither only once, on the final pass, to avoid accumulating noise across passes.
+    if (is_final_pass) {
+        let dither_amount = 1.0 / 255.0;
+        final_rgb += dither(id.xy) * dither_amount;
+    }
 
     textureStore(output_texture, id.xy, vec4<f32>(clamp(final_rgb, vec3<f32>(0.0), vec3<f32>(1.0)), original_alpha));
 }

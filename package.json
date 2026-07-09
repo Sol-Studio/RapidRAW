@@ -26,6 +26,7 @@
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@uiw/color-convert": "^2.10.1",
     "@uiw/react-color-wheel": "^2.10.1",
+    "@xyflow/react": "^12.11.2",
     "clsx": "^2.1.1",
     "framer-motion": "^12.38.0",
     "i18next": "^26.3.0",

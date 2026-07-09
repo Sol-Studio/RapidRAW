@@ -25,7 +25,7 @@ use crate::image_loader::{
 };
 use crate::image_processing::{
     AllAdjustments, Crop, GpuContext, RenderRequest, downscale_f32_image,
-    get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
+    get_all_adjustments_from_json, get_node_passes_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
     resolve_tonemapper_override_from_handle,
 };
 use crate::lut_processing::{
@@ -266,6 +266,7 @@ fn process_image_for_export_pipeline(
             mask_bitmaps: &mask_bitmaps,
             lut,
             roi: None,
+            node_passes: get_node_passes_from_json(js_adjustments, is_raw, tm_override).unwrap_or_default(),
         },
         debug_tag,
     )
@@ -364,12 +365,8 @@ fn process_image_for_export(
 
 fn build_single_mask_adjustments(all: &AllAdjustments, mask_index: usize) -> AllAdjustments {
     let mut single = AllAdjustments {
-        global: all.global,
-        mask_adjustments: all.mask_adjustments,
         mask_count: 1,
-        tile_offset_x: all.tile_offset_x,
-        tile_offset_y: all.tile_offset_y,
-        mask_atlas_cols: all.mask_atlas_cols,
+        ..*all
     };
     single.mask_adjustments[0] = all.mask_adjustments[mask_index];
     for i in 1..single.mask_adjustments.len() {
@@ -536,6 +533,7 @@ fn export_masks_for_image(
                     mask_bitmaps: &single_bitmaps,
                     lut: lut.clone(),
                     roi: None,
+                    node_passes: Vec::new(),
                 },
                 "export_mask_image",
             )?;
@@ -629,6 +627,7 @@ fn export_adjustments_as_lut(
             mask_bitmaps: &[],
             lut,
             roi: None,
+            node_passes: get_node_passes_from_json(js_adjustments, false, tm_override).unwrap_or_default(),
         },
         "export_lut",
     )?;
@@ -1133,6 +1132,7 @@ pub async fn estimate_export_sizes(
                 mask_bitmaps: &mask_bitmaps,
                 lut,
                 roi: None,
+                node_passes: get_node_passes_from_json(&adjustments_clone, is_raw, tm_override).unwrap_or_default(),
             },
             "estimate_export_size",
         )?;
@@ -1271,6 +1271,7 @@ pub async fn estimate_export_sizes(
                 mask_bitmaps: &mask_bitmaps,
                 lut,
                 roi: None,
+                node_passes: get_node_passes_from_json(&js_adjustments, is_raw, tm_override).unwrap_or_default(),
             },
             "estimate_batch_export_size",
         )?;

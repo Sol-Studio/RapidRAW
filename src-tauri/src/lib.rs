@@ -79,7 +79,7 @@ use crate::image_loader::{composite_patches_on_image, load_and_composite};
 use crate::image_processing::{
     Crop, GeometryParams, RenderRequest, apply_coarse_rotation, apply_cpu_default_raw_processing,
     apply_flip, apply_geometry_warp, apply_linear_to_srgb, downscale_f32_image,
-    get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
+    get_all_adjustments_from_json, get_node_passes_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
     resolve_tonemapper_override, resolve_tonemapper_override_from_handle, warp_image_geometry,
 };
 use crate::mask_generation::{
@@ -490,6 +490,10 @@ fn process_preview_job(
         None
     };
 
+    let node_passes =
+        get_node_passes_from_json(&adjustments_clone, is_raw, tm_override).unwrap_or_default();
+    let node_pass_count = node_passes.len();
+
     let final_processed_image_result =
         crate::image_processing::process_and_get_dynamic_image_with_analytics(
             &context,
@@ -501,6 +505,7 @@ fn process_preview_job(
                 mask_bitmaps: &mask_bitmaps,
                 lut,
                 roi: pixel_roi,
+                node_passes,
             },
             "apply_adjustments",
             use_wgpu_renderer,
@@ -508,6 +513,20 @@ fn process_preview_job(
         );
 
     if let Ok(final_processed_image) = final_processed_image_result {
+        // Sync event for the node pipeline: emitted after the last pass of the
+        // multi-pass loop has been submitted and waited on, so the frontend can
+        // rely on the surface holding the fully chained result.
+        if node_pass_count > 0 {
+            let _ = context.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(500)),
+            });
+            let _ = app_handle.emit(
+                "node-graph-render-complete",
+                serde_json::json!({ "path": loaded_image.path, "passCount": node_pass_count }),
+            );
+        }
+
         if use_wgpu_renderer {
             let _ = context.device.poll(wgpu::PollType::Wait {
                 submission_index: None,
@@ -808,6 +827,7 @@ fn generate_uncropped_preview(
                 mask_bitmaps: &mask_bitmaps,
                 lut,
                 roi: None,
+                node_passes: get_node_passes_from_json(&adjustments_clone, is_raw, tm_override).unwrap_or_default(),
             },
             "generate_uncropped_preview",
         ) {
@@ -973,6 +993,7 @@ async fn preview_geometry_transform(
                     mask_bitmaps: &mask_bitmaps,
                     lut,
                     roi: None,
+                    node_passes: get_node_passes_from_json(&temp_adjustments, is_raw, tm_override).unwrap_or_default(),
                 },
                 "preview_geometry_transform_base_gen",
             )?;
@@ -1155,6 +1176,7 @@ fn generate_preset_preview(
             mask_bitmaps: &mask_bitmaps,
             lut,
             roi: None,
+            node_passes: get_node_passes_from_json(&js_adjustments, is_raw, tm_override).unwrap_or_default(),
         },
         "generate_preset_preview",
     )?;
@@ -1306,6 +1328,7 @@ async fn generate_all_community_previews(
                     mask_bitmaps: &mask_bitmaps,
                     lut,
                     roi: None,
+                    node_passes: get_node_passes_from_json(&scaled_adjustments, *is_raw, tm_override).unwrap_or_default(),
                 },
                 "generate_all_community_previews",
             )?;
@@ -1585,6 +1608,7 @@ fn generate_preview_for_path(
             mask_bitmaps: &mask_bitmaps,
             lut,
             roi: None,
+            node_passes: get_node_passes_from_json(&js_adjustments, is_raw, tm_override).unwrap_or_default(),
         },
         "generate_preview_for_path",
     )?;

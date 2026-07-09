@@ -225,6 +225,15 @@ export function useTauriListeners({
           useEditorStore.getState().setEditor({ hasRenderedFirstFrame: true });
         }
       }),
+      // Emitted by the backend once the final pass of the node-graph multi-pass
+      // loop has completed, guaranteeing the WGPU surface shows the fully
+      // chained result. Marking the frame rendered forces the canvas to bind to
+      // the updated surface texture instead of a stale preview.
+      listen('node-graph-render-complete', (event: any) => {
+        if (isEffectActive && event.payload?.path === useEditorStore.getState().selectedImage?.path) {
+          useEditorStore.getState().setEditor({ hasRenderedFirstFrame: true });
+        }
+      }),
       listen('panorama-progress', (event: any) => {
         if (isEffectActive) {
           useUIStore.getState().setUI((state) => {

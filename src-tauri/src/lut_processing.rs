@@ -583,6 +583,7 @@ fn render_lut_swatch(
             mask_bitmaps: &[],
             lut: Some(lut),
             roi: None,
+            node_passes: Vec::new(),
         },
         "generate_lut_previews",
     )

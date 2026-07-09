@@ -9,7 +9,7 @@ use std::num::NonZero;
 use tauri::Manager;
 use wgpu::util::{DeviceExt, TextureDataOrder};
 
-use crate::image_processing::{AllAdjustments, GpuContext, MAX_MASKS};
+use crate::image_processing::{op_flags, AllAdjustments, GpuContext, MAX_MASKS};
 use crate::lut_processing::Lut;
 use crate::{AppState, GpuImageCache};
 
@@ -26,6 +26,10 @@ pub struct RenderRequest<'a> {
     pub mask_bitmaps: &'a [ImageBuffer<Luma<u8>, Vec<u8>>],
     pub lut: Option<Arc<Lut>>,
     pub roi: Option<Roi>,
+    /// Topologically sorted node-graph passes. Empty means legacy single-pass
+    /// rendering using `adjustments`. When non-empty, the shader is executed once
+    /// per entry, ping-ponging between two f32 intermediary textures.
+    pub node_passes: Vec<AllAdjustments>,
 }
 
 #[repr(C)]
@@ -531,6 +535,10 @@ pub struct GpuProcessor {
 
     main_bgl: wgpu::BindGroupLayout,
     main_pipeline: wgpu::ComputePipeline,
+    node_bgl: wgpu::BindGroupLayout,
+    node_pipeline: wgpu::ComputePipeline,
+    node_texture_a_view: wgpu::TextureView,
+    node_texture_b_view: wgpu::TextureView,
     adjustments_buffer: wgpu::Buffer,
     dummy_blur_view: wgpu::TextureView,
     dummy_lut_view: wgpu::TextureView,
@@ -550,6 +558,9 @@ pub struct GpuProcessor {
 }
 
 const FLARE_MAP_SIZE: u32 = 512;
+
+const TILE_SIZE: u32 = 2048;
+const TILE_OVERLAP: u32 = 128;
 
 impl GpuProcessor {
     pub fn new(context: GpuContext, max_width: u32, max_height: u32) -> Result<Self, String> {
@@ -772,12 +783,24 @@ impl GpuProcessor {
             ..Default::default()
         });
 
+        let shader_source = include_str!("shaders/shader.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Image Processing Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        let mut bind_group_layout_entries = vec![
+        // Same monolithic shader, but writing to a 32-bit float storage texture.
+        // Used for the intermediate passes of the node pipeline so precision is
+        // preserved while ping-ponging between textures.
+        let node_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Image Processing Shader (f32 intermediate)"),
+            source: wgpu::ShaderSource::Wgsl(
+                shader_source.replace("rgba8unorm", "rgba32float").into(),
+            ),
+        });
+
+        let make_bgl_entries = |output_format: wgpu::TextureFormat| {
+            let mut bind_group_layout_entries = vec![
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -793,7 +816,7 @@ impl GpuProcessor {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: output_format,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -896,9 +919,12 @@ impl GpuProcessor {
             count: None,
         });
 
+            bind_group_layout_entries
+        };
+
         let main_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Main BGL"),
-            entries: &bind_group_layout_entries,
+            entries: &make_bgl_entries(wgpu::TextureFormat::Rgba8Unorm),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -911,6 +937,26 @@ impl GpuProcessor {
             label: Some("Compute Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let node_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Node BGL"),
+            entries: &make_bgl_entries(wgpu::TextureFormat::Rgba32Float),
+        });
+
+        let node_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Node Pipeline Layout"),
+            bind_group_layouts: &[Some(&node_bgl)],
+            immediate_size: 0,
+        });
+
+        let node_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Node Compute Pipeline"),
+            layout: Some(&node_pipeline_layout),
+            module: &node_shader_module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
@@ -969,6 +1015,33 @@ impl GpuProcessor {
             ..reusable_texture_desc
         });
         let ping_pong_view = ping_pong_texture.create_view(&Default::default());
+
+        // Two 32-bit float intermediary textures for the node-graph multi-pass
+        // pipeline. Passes ping-pong between them: original -> A -> B -> A -> ...
+        // Intermediate passes operate tile-locally, so a single tile footprint
+        // (plus overlap) is all the VRAM this needs.
+        let node_texture_size = wgpu::Extent3d {
+            width: max_width.min(TILE_SIZE + 2 * TILE_OVERLAP),
+            height: max_height.min(TILE_SIZE + 2 * TILE_OVERLAP),
+            depth_or_array_layers: 1,
+        };
+        let node_texture_desc = wgpu::TextureDescriptor {
+            label: Some("Node Pipeline Texture A"),
+            size: node_texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        };
+        let node_texture_a = device.create_texture(&node_texture_desc);
+        let node_texture_a_view = node_texture_a.create_view(&Default::default());
+        let node_texture_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Node Pipeline Texture B"),
+            ..node_texture_desc
+        });
+        let node_texture_b_view = node_texture_b.create_view(&Default::default());
 
         let sharpness_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Sharpness Blur Texture"),
@@ -1055,6 +1128,10 @@ impl GpuProcessor {
             flare_sampler,
             main_bgl,
             main_pipeline,
+            node_bgl,
+            node_pipeline,
+            node_texture_a_view,
+            node_texture_b_view,
             adjustments_buffer,
             dummy_blur_view,
             dummy_lut_view,
@@ -1276,9 +1353,6 @@ impl GpuProcessor {
             queue.submit(Some(encoder.finish()));
         }
 
-        const TILE_SIZE: u32 = 2048;
-        const TILE_OVERLAP: u32 = 128;
-
         let mut final_pixels = vec![
             0u8;
             if skip_cpu_readback {
@@ -1323,7 +1397,12 @@ impl GpuProcessor {
                     depth_or_array_layers: 1,
                 };
 
-                let run_blur = |base_radius: f32, output_view: &wgpu::TextureView| -> bool {
+                let run_blur = |base_radius: f32,
+                                blur_src_view: &wgpu::TextureView,
+                                blur_off_x: u32,
+                                blur_off_y: u32,
+                                output_view: &wgpu::TextureView|
+                 -> bool {
                     let radius = (base_radius * scale).ceil().max(1.0) as u32;
                     if radius == 0 {
                         return false;
@@ -1331,8 +1410,8 @@ impl GpuProcessor {
 
                     let params = BlurParams {
                         radius,
-                        tile_offset_x: input_x_start,
-                        tile_offset_y: input_y_start,
+                        tile_offset_x: blur_off_x,
+                        tile_offset_y: blur_off_y,
                         input_width,
                         input_height,
                         _pad1: 0,
@@ -1349,7 +1428,7 @@ impl GpuProcessor {
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(input_texture_view),
+                                resource: wgpu::BindingResource::TextureView(blur_src_view),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -1399,16 +1478,90 @@ impl GpuProcessor {
                     true
                 };
 
-                let did_create_sharpness_blur = run_blur(1.0, &self.sharpness_blur_view);
-                let did_create_tonal_blur = run_blur(3.5, &self.tonal_blur_view);
-                let did_create_clarity_blur = run_blur(8.0, &self.clarity_blur_view);
-                let did_create_structure_blur = run_blur(40.0, &self.structure_blur_view);
+                // Multi-pass node pipeline: run the whole shader once per node,
+                // ping-ponging between the two f32 intermediary textures.
+                // A single legacy pass renders exactly like the pre-graph pipeline.
+                let passes: &[AllAdjustments] = if request.node_passes.is_empty() {
+                    std::slice::from_ref(&adjustments)
+                } else {
+                    request.node_passes.as_slice()
+                };
+                let pass_count = passes.len();
+
+                let crop_x_start = x_start - input_x_start;
+                let crop_y_start = y_start - input_y_start;
+
+                for (pass_idx, pass_adjustments) in passes.iter().enumerate() {
+                let is_first_pass = pass_idx == 0;
+                let is_final_pass = pass_idx + 1 == pass_count;
+
+                let pass_input_view: &wgpu::TextureView = if is_first_pass {
+                    input_texture_view
+                } else if pass_idx % 2 == 1 {
+                    &self.node_texture_a_view
+                } else {
+                    &self.node_texture_b_view
+                };
+                let (pass_pipeline, pass_bgl, pass_output_view) = if is_final_pass {
+                    (
+                        &self.main_pipeline,
+                        &self.main_bgl,
+                        &self.tile_output_texture_view,
+                    )
+                } else if pass_idx % 2 == 0 {
+                    (&self.node_pipeline, &self.node_bgl, &self.node_texture_a_view)
+                } else {
+                    (&self.node_pipeline, &self.node_bgl, &self.node_texture_b_view)
+                };
+
+                // The first pass reads the original image at absolute tile offsets;
+                // later passes read the previous pass's tile-local output at (0, 0).
+                let (blur_off_x, blur_off_y) = if is_first_pass {
+                    (input_x_start, input_y_start)
+                } else {
+                    (0, 0)
+                };
+
+                // Blur pyramids are only consumed by tone / detail / effect ops, so
+                // skip the eight blur dispatches for passes that cannot use them.
+                let blur_ops = op_flags::DETAILS
+                    | op_flags::DEHAZE
+                    | op_flags::CONTRAST
+                    | op_flags::TONE
+                    | op_flags::EFFECTS;
+                let needs_blur = pass_adjustments.enabled_ops == 0
+                    || (pass_adjustments.enabled_ops & blur_ops) != 0;
+
+                let did_create_sharpness_blur = needs_blur
+                    && run_blur(1.0, pass_input_view, blur_off_x, blur_off_y, &self.sharpness_blur_view);
+                let did_create_tonal_blur = needs_blur
+                    && run_blur(3.5, pass_input_view, blur_off_x, blur_off_y, &self.tonal_blur_view);
+                let did_create_clarity_blur = needs_blur
+                    && run_blur(8.0, pass_input_view, blur_off_x, blur_off_y, &self.clarity_blur_view);
+                let did_create_structure_blur = needs_blur
+                    && run_blur(40.0, pass_input_view, blur_off_x, blur_off_y, &self.structure_blur_view);
 
                 let mut main_encoder = device.create_command_encoder(&Default::default());
 
-                let mut tile_adjustments = adjustments;
-                tile_adjustments.tile_offset_x = input_x_start;
-                tile_adjustments.tile_offset_y = input_y_start;
+                let mut tile_adjustments = *pass_adjustments;
+                if is_first_pass {
+                    tile_adjustments.tile_offset_x = input_x_start;
+                    tile_adjustments.tile_offset_y = input_y_start;
+                    tile_adjustments.full_width = width;
+                    tile_adjustments.full_height = height;
+                } else {
+                    tile_adjustments.tile_offset_x = 0;
+                    tile_adjustments.tile_offset_y = 0;
+                    tile_adjustments.full_width = input_width;
+                    tile_adjustments.full_height = input_height;
+                }
+                tile_adjustments.pass_flags = 0;
+                if is_first_pass {
+                    tile_adjustments.pass_flags |= op_flags::PASS_FIRST;
+                }
+                if is_final_pass {
+                    tile_adjustments.pass_flags |= op_flags::PASS_FINAL;
+                }
                 queue.write_buffer(
                     &self.adjustments_buffer,
                     0,
@@ -1418,13 +1571,11 @@ impl GpuProcessor {
                 let mut bind_group_entries = vec![
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input_texture_view),
+                        resource: wgpu::BindingResource::TextureView(pass_input_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.tile_output_texture_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(pass_output_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -1493,13 +1644,13 @@ impl GpuProcessor {
 
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Tile Bind Group"),
-                    layout: &self.main_bgl,
+                    layout: pass_bgl,
                     entries: &bind_group_entries,
                 });
 
                 {
                     let mut compute_pass = main_encoder.begin_compute_pass(&Default::default());
-                    compute_pass.set_pipeline(&self.main_pipeline);
+                    compute_pass.set_pipeline(pass_pipeline);
                     compute_pass.set_bind_group(0, &bind_group, &[]);
                     compute_pass.dispatch_workgroups(
                         input_width.div_ceil(8),
@@ -1508,10 +1659,7 @@ impl GpuProcessor {
                     );
                 }
 
-                let crop_x_start = x_start - input_x_start;
-                let crop_y_start = y_start - input_y_start;
-
-                if output_to_display {
+                if is_final_pass && output_to_display {
                     main_encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: &self.tile_output_texture,
@@ -1542,6 +1690,7 @@ impl GpuProcessor {
                 }
 
                 queue.submit(Some(main_encoder.finish()));
+                }
 
                 if !skip_cpu_readback {
                     let processed_tile_data = read_texture_data_roi(
@@ -2016,4 +2165,168 @@ fn process_and_get_dynamic_image_inner(
     let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(out_w, out_h, processed_pixels)
         .ok_or("Failed to create image buffer from GPU data")?;
     Ok(DynamicImage::ImageRgba8(img_buf))
+}
+
+#[cfg(test)]
+mod shader_validation_tests {
+    /// The WGSL shader is only compiled at runtime by wgpu; this test validates it
+    /// (and the rgba32float node-pipeline variant) at `cargo test` time instead.
+    #[test]
+    fn monolithic_shader_parses_and_validates() {
+        let source = include_str!("shaders/shader.wgsl");
+        for (label, src) in [
+            ("rgba8unorm", source.to_string()),
+            ("rgba32float", source.replace("rgba8unorm", "rgba32float")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("[{label}] WGSL parse error: {e}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("[{label}] WGSL validation error: {e:?}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod multi_pass_tests {
+    use super::*;
+    use crate::image_processing::op_flags;
+
+    fn make_context() -> Option<GpuContext> {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .ok()?;
+        let limits = adapter.limits();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Test Device"),
+            required_limits: limits.clone(),
+            ..Default::default()
+        }))
+        .ok()?;
+        Some(GpuContext {
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            limits,
+            display: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    fn make_input(context: &GpuContext, size: u32, gray: f32) -> wgpu::TextureView {
+        let pixel = [
+            f16::from_f32(gray),
+            f16::from_f32(gray),
+            f16::from_f32(gray),
+            f16::ONE,
+        ];
+        let data: Vec<f16> = (0..size * size).flat_map(|_| pixel).collect();
+        let texture = context.device.create_texture_with_data(
+            &context.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Test Input"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&data),
+        );
+        texture.create_view(&Default::default())
+    }
+
+    fn render(
+        processor: &GpuProcessor,
+        input: &wgpu::TextureView,
+        size: u32,
+        adjustments: AllAdjustments,
+        node_passes: Vec<AllAdjustments>,
+    ) -> Vec<u8> {
+        let (pixels, ..) = processor
+            .run(
+                input,
+                size,
+                size,
+                RenderRequest {
+                    adjustments,
+                    mask_bitmaps: &[],
+                    lut: None,
+                    roi: None,
+                    node_passes,
+                },
+                false,
+                false,
+            )
+            .expect("render failed");
+        pixels
+    }
+
+    fn center_pixel(pixels: &[u8], size: u32) -> [u8; 3] {
+        let idx = ((size / 2) * size + size / 2) as usize * 4;
+        [pixels[idx], pixels[idx + 1], pixels[idx + 2]]
+    }
+
+    /// End-to-end check of the node pipeline: a two-pass chain
+    /// (exposure node -> passthrough node) ping-pongs through the f32
+    /// intermediary textures and must match the legacy single-pass render of
+    /// the same (flattened) adjustments within dither/precision tolerance.
+    #[test]
+    fn node_pipeline_matches_legacy_single_pass() {
+        let Some(context) = make_context() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        const SIZE: u32 = 64;
+        let processor = GpuProcessor::new(context.clone(), 256, 256).expect("processor");
+        let input = make_input(&context, SIZE, 0.25);
+
+        let mut exposure_adj = AllAdjustments::default();
+        exposure_adj.global.exposure = 1.0; // pre-scaled shader value: +1 EV
+        exposure_adj.enabled_ops = op_flags::ALL;
+        exposure_adj.pass_flags = op_flags::PASS_FIRST | op_flags::PASS_FINAL;
+
+        let legacy = render(&processor, &input, SIZE, exposure_adj, Vec::new());
+        let legacy_px = center_pixel(&legacy, SIZE);
+
+        let mut pass1 = exposure_adj;
+        pass1.enabled_ops = op_flags::EXPOSURE;
+        pass1.pass_flags = op_flags::PASS_FIRST;
+        let mut pass2 = AllAdjustments::default();
+        pass2.enabled_ops = op_flags::NONE_MARKER;
+        pass2.pass_flags = op_flags::PASS_FINAL;
+
+        let multi = render(&processor, &input, SIZE, exposure_adj, vec![pass1, pass2]);
+        let multi_px = center_pixel(&multi, SIZE);
+
+        for c in 0..3 {
+            let diff = (legacy_px[c] as i32 - multi_px[c] as i32).abs();
+            assert!(
+                diff <= 4,
+                "channel {c}: legacy {legacy_px:?} vs multi-pass {multi_px:?}"
+            );
+        }
+
+        // Sanity: the exposure pass actually brightened the mid-gray input.
+        let mut identity = AllAdjustments::default();
+        identity.enabled_ops = op_flags::NONE_MARKER;
+        let neutral = render(&processor, &input, SIZE, identity, Vec::new());
+        let neutral_px = center_pixel(&neutral, SIZE);
+        assert!(
+            multi_px[0] as i32 - neutral_px[0] as i32 > 20,
+            "exposure pass had no effect: neutral {neutral_px:?} vs exposed {multi_px:?}"
+        );
+    }
 }

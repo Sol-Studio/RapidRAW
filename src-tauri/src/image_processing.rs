@@ -1395,6 +1395,58 @@ pub struct MaskAdjustments {
 
 pub const MAX_MASKS: usize = 32;
 
+/// Bit flags controlling which processing functions run in a shader pass.
+/// Mirrored by the OP_* constants in shaders/shader.wgsl.
+pub mod op_flags {
+    pub const EXPOSURE: u32 = 1 << 0;
+    pub const BRIGHTNESS: u32 = 1 << 1;
+    pub const CONTRAST: u32 = 1 << 2;
+    pub const TONE: u32 = 1 << 3; // highlights / shadows / whites / blacks
+    pub const WHITE_BALANCE: u32 = 1 << 4; // temperature / tint
+    pub const SATURATION: u32 = 1 << 5;
+    pub const VIBRANCE: u32 = 1 << 6;
+    pub const HUE: u32 = 1 << 7;
+    pub const CURVES: u32 = 1 << 8;
+    pub const HSL: u32 = 1 << 9;
+    pub const COLOR_GRADING: u32 = 1 << 10;
+    pub const COLOR_CALIBRATION: u32 = 1 << 11;
+    pub const DETAILS: u32 = 1 << 12; // sharpness / clarity / structure / NR / centré
+    pub const DEHAZE: u32 = 1 << 13;
+    pub const EFFECTS: u32 = 1 << 14; // vignette / grain / glow / halation / flare
+    pub const LUT: u32 = 1 << 15;
+    pub const CHROMATIC_ABERRATION: u32 = 1 << 16;
+    /// Marker bit that maps to no operation: a pass with only this bit is a passthrough.
+    pub const NONE_MARKER: u32 = 1 << 31;
+    pub const ALL: u32 = 0xFFFF_FFFF;
+
+    pub const PASS_FIRST: u32 = 1 << 0;
+    pub const PASS_FINAL: u32 = 1 << 1;
+
+    /// Maps a frontend node op identifier to its shader flag bits.
+    pub fn bits_for_op(op: &str) -> u32 {
+        match op {
+            "exposure" => EXPOSURE,
+            "brightness" => BRIGHTNESS,
+            "contrast" => CONTRAST,
+            "tone" => TONE,
+            "whiteBalance" => WHITE_BALANCE,
+            "saturation" => SATURATION,
+            "vibrance" => VIBRANCE,
+            "hue" => HUE,
+            "curves" => CURVES,
+            "hsl" => HSL,
+            "colorGrading" => COLOR_GRADING,
+            "colorCalibration" => COLOR_CALIBRATION,
+            "details" => DETAILS,
+            "dehaze" => DEHAZE,
+            "effects" => EFFECTS,
+            "lut" => LUT,
+            "chromaticAberration" => CHROMATIC_ABERRATION,
+            _ => NONE_MARKER,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Pod, Zeroable, Default)]
 #[repr(C)]
 pub struct AllAdjustments {
@@ -1404,6 +1456,14 @@ pub struct AllAdjustments {
     pub tile_offset_x: u32,
     pub tile_offset_y: u32,
     pub mask_atlas_cols: u32,
+    /// op_flags bitmask; 0 is treated as "all enabled" by the shader for backwards compatibility.
+    pub enabled_ops: u32,
+    /// op_flags::PASS_* bits; 0 is treated as FIRST|FINAL by the shader.
+    pub pass_flags: u32,
+    /// Actual full-image dimensions of the coordinate space of the current pass input.
+    /// 0 means "use textureDimensions(input_texture)" (legacy single-pass behavior).
+    pub full_width: u32,
+    pub full_height: u32,
 }
 
 struct AdjustmentScales {
@@ -2317,7 +2377,79 @@ pub fn get_all_adjustments_from_json(
         tile_offset_x: 0,
         tile_offset_y: 0,
         mask_atlas_cols: 1,
+        enabled_ops: op_flags::ALL,
+        pass_flags: op_flags::PASS_FIRST | op_flags::PASS_FINAL,
+        full_width: 0,
+        full_height: 0,
     }
+}
+
+/// Builds the ordered per-pass adjustment list for the node-graph multi-pass pipeline.
+///
+/// The frontend serializes its topologically sorted node graph into
+/// `js_adjustments["nodePipeline"]`: an array of `{ "op": string, "enabled": bool,
+/// "values": { ...standard adjustment keys... } }` entries. Each entry becomes one
+/// GPU pass that runs the monolithic shader with only that node's op bits enabled.
+///
+/// Returns `None` when no node pipeline is present (legacy single-pass mode).
+pub fn get_node_passes_from_json(
+    js_adjustments: &serde_json::Value,
+    is_raw: bool,
+    tonemapper_override: Option<u32>,
+) -> Option<Vec<AllAdjustments>> {
+    let nodes = js_adjustments.get("nodePipeline")?.as_array()?;
+    if nodes.is_empty() {
+        return None;
+    }
+
+    // The top-level document carries masks, clipping toggle and tonemapper choice
+    // that apply to the whole pipeline rather than to a single node.
+    let base = get_all_adjustments_from_json(js_adjustments, is_raw, tonemapper_override);
+
+    let mut passes: Vec<AllAdjustments> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let enabled = node
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let op = node.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let values = node
+            .get("values")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let is_first = passes.is_empty();
+        // Only the first pass linearizes RAW input and applies the tonemapper;
+        // subsequent passes operate on the sRGB-encoded intermediate texture.
+        let pass_is_raw = is_raw && is_first;
+        let pass_tm = if is_first { tonemapper_override } else { Some(0) };
+
+        let mut adj = get_all_adjustments_from_json(&values, pass_is_raw, pass_tm);
+        adj.mask_adjustments = base.mask_adjustments;
+        adj.mask_count = base.mask_count;
+        adj.global.show_clipping = base.global.show_clipping;
+        if is_first {
+            adj.global.tonemapper_mode = base.global.tonemapper_mode;
+        }
+        adj.enabled_ops = op_flags::bits_for_op(op);
+        adj.pass_flags = 0;
+        passes.push(adj);
+    }
+
+    if passes.is_empty() {
+        // Graph present but every node disabled: render one passthrough pass so the
+        // preview shows the (linearized/tonemapped) source image.
+        let mut adj = base;
+        adj.enabled_ops = op_flags::NONE_MARKER;
+        passes.push(adj);
+    }
+
+    passes.first_mut().unwrap().pass_flags |= op_flags::PASS_FIRST;
+    passes.last_mut().unwrap().pass_flags |= op_flags::PASS_FINAL;
+    Some(passes)
 }
 
 #[derive(Clone)]
@@ -3259,4 +3391,63 @@ pub fn calculate_auto_adjustments(
     let results = perform_auto_analysis(&original_image);
 
     Ok(auto_results_to_json(&results))
+}
+
+#[cfg(test)]
+mod node_pass_tests {
+    use super::*;
+
+    #[test]
+    fn node_pipeline_json_builds_ordered_passes() {
+        let js = serde_json::json!({
+            "exposure": 0.5,
+            "nodePipeline": [
+                { "op": "exposure", "enabled": true, "values": { "exposure": 1.6 } },
+                { "op": "saturation", "enabled": false, "values": { "saturation": 80.0 } },
+                { "op": "contrast", "values": { "contrast": 50.0 } }
+            ]
+        });
+
+        let passes = get_node_passes_from_json(&js, true, None).expect("passes");
+        // Disabled node is skipped.
+        assert_eq!(passes.len(), 2);
+
+        assert_eq!(passes[0].enabled_ops, op_flags::EXPOSURE);
+        assert_eq!(passes[0].pass_flags, op_flags::PASS_FIRST);
+        // Node values, not the flattened top-level value (1.6 / SCALE 0.8 = 2.0).
+        assert!((passes[0].global.exposure - 2.0).abs() < 1e-5);
+        // Only the first pass linearizes RAW input.
+        assert_eq!(passes[0].global.is_raw_image, 1);
+
+        assert_eq!(passes[1].enabled_ops, op_flags::CONTRAST);
+        assert_eq!(passes[1].pass_flags, op_flags::PASS_FINAL);
+        assert!((passes[1].global.contrast - 0.5).abs() < 1e-5);
+        assert_eq!(passes[1].global.is_raw_image, 0);
+        assert_eq!(passes[1].global.tonemapper_mode, 0);
+    }
+
+    #[test]
+    fn missing_or_empty_pipeline_falls_back_to_legacy() {
+        assert!(get_node_passes_from_json(&serde_json::json!({ "exposure": 1.0 }), false, None).is_none());
+        assert!(
+            get_node_passes_from_json(&serde_json::json!({ "nodePipeline": [] }), false, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn all_nodes_disabled_yields_single_passthrough() {
+        let js = serde_json::json!({
+            "nodePipeline": [
+                { "op": "exposure", "enabled": false, "values": { "exposure": 1.0 } }
+            ]
+        });
+        let passes = get_node_passes_from_json(&js, false, None).expect("passes");
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].enabled_ops, op_flags::NONE_MARKER);
+        assert_eq!(
+            passes[0].pass_flags,
+            op_flags::PASS_FIRST | op_flags::PASS_FINAL
+        );
+    }
 }

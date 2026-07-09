@@ -107,6 +107,13 @@ function shouldIgnoreMessage(message: string): boolean {
     return true;
   }
 
+  // Benign browser notice emitted by ResizeObserver-based libraries (e.g.
+  // React Flow) when a resize callback schedules further layout work; the
+  // browser resolves it on the next frame. Not an error worth forwarding.
+  if (normalized.includes('resizeobserver loop')) {
+    return true;
+  }
+
   return false;
 }
 

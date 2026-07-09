@@ -91,6 +91,9 @@ interface UIState {
   bottomPanelHeight: number;
   compactEditorPanelHeightOverride: number | null;
 
+  // Node Graph Editor
+  isNodeEditorVisible: boolean;
+
   // Right Panel
   activeRightPanel: Panel | null;
   renderedRightPanel: Panel | null;
@@ -143,6 +146,8 @@ export const useUIStore = create<UIState>((set, get) => ({
   rightPanelWidth: 320,
   bottomPanelHeight: 144,
   compactEditorPanelHeightOverride: null,
+
+  isNodeEditorVisible: false,
 
   activeRightPanel: Panel.Adjustments,
   renderedRightPanel: Panel.Adjustments,

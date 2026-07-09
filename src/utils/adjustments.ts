@@ -1,6 +1,7 @@
 import { Crop } from 'react-image-crop';
 import { v4 as uuidv4 } from 'uuid';
 import { SubMask, SubMaskMode } from '../components/panel/right/Masks';
+import { NodeGraphData, NodePipelineEntry } from '../types/nodeGraph';
 
 export enum ActiveChannel {
   Blue = 'blue',
@@ -205,6 +206,10 @@ export interface Adjustments {
   lutPath?: string | null;
   lutSize?: number;
   masks: Array<MaskContainer>;
+  /** Persisted node-editor layout (nodes + edges) for the DAG pipeline. */
+  nodeGraph?: NodeGraphData | null;
+  /** Topologically sorted pass list; presence switches the backend to multi-pass rendering. */
+  nodePipeline?: NodePipelineEntry[];
   orientationSteps: number;
   rotation: number;
   saturation: number;

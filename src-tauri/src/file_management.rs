@@ -1305,6 +1305,12 @@ pub fn generate_thumbnail_data(
                 mask_bitmaps: &mask_bitmaps,
                 lut,
                 roi: None,
+                node_passes: crate::image_processing::get_node_passes_from_json(
+                    &meta.adjustments,
+                    is_raw,
+                    tm_override,
+                )
+                .unwrap_or_default(),
             },
             "generate_thumbnail_data",
         ) {
