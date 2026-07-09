@@ -117,10 +117,10 @@ export enum ExifOverlay {
 }
 
 export enum Panel {
-  Adjustments = 'adjustments',
   Ai = 'ai',
   Crop = 'crop',
   Export = 'export',
+  Graph = 'graph',
   Masks = 'masks',
   Metadata = 'metadata',
   Presets = 'presets',

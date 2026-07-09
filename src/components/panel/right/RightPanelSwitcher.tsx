@@ -1,14 +1,5 @@
 import { motion } from 'framer-motion';
-import {
-  SlidersHorizontal,
-  Info,
-  Crop,
-  Layers,
-  Paintbrush,
-  SwatchBook,
-  FileInput,
-  type LucideIcon,
-} from 'lucide-react';
+import { Workflow, Info, Crop, Layers, Paintbrush, SwatchBook, FileInput, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Panel } from '../../ui/AppProperties';
 
@@ -28,7 +19,7 @@ interface RightPanelSwitcherProps {
 const panelGroups: Array<Array<PanelOptions>> = [
   [{ id: Panel.Metadata, icon: Info, title: 'editor.switcher.tooltips.info' }],
   [
-    { id: Panel.Adjustments, icon: SlidersHorizontal, title: 'editor.switcher.tooltips.adjust' },
+    { id: Panel.Graph, icon: Workflow, title: 'editor.switcher.tooltips.graph' },
     { id: Panel.Crop, icon: Crop, title: 'editor.switcher.tooltips.crop' },
     { id: Panel.Masks, icon: Layers, title: 'editor.switcher.tooltips.masks' },
     { id: Panel.Ai, icon: Paintbrush, title: 'editor.switcher.tooltips.inpaint' },

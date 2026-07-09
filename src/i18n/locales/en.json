@@ -690,9 +690,9 @@
     },
     "switcher": {
       "tooltips": {
-        "adjust": "Adjust",
         "crop": "Crop",
         "export": "Export",
+        "graph": "Graph Editor",
         "info": "Info",
         "inpaint": "Inpaint",
         "masks": "Masks",

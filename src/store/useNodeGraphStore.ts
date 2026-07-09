@@ -1,6 +1,13 @@
 import { create } from 'zustand';
-import { GraphEdge, GraphNode, NodeGraphData, NodeOpType } from '../types/nodeGraph';
-import { createDefaultGraph, createOpNode, wouldCreateCycle } from '../utils/nodeGraph';
+import { GraphEdge, GraphNode, NodeGraphData, NodeOpType, NodeValues } from '../types/nodeGraph';
+import {
+  NODE_CHAIN_STEP_Y,
+  NODE_CHAIN_TOP_Y,
+  NODE_CHAIN_X,
+  createDefaultGraph,
+  createOpNode,
+  wouldCreateCycle,
+} from '../utils/nodeGraph';
 
 /**
  * Canonical DAG state of the node-based editing pipeline.
@@ -20,7 +27,7 @@ interface NodeGraphState {
   setEdges: (edges: GraphEdge[]) => void;
   addOpNode: (op: NodeOpType, position?: { x: number; y: number }) => GraphNode;
   removeNode: (id: string) => void;
-  updateNodeValues: (id: string, values: Record<string, number>) => void;
+  updateNodeValues: (id: string, values: NodeValues) => void;
   setNodeEnabled: (id: string, enabled: boolean) => void;
   connect: (source: string, target: string) => boolean;
   disconnect: (edgeId: string) => void;
@@ -37,7 +44,12 @@ export const useNodeGraphStore = create<NodeGraphState>((set, get) => ({
   addOpNode: (op, position) => {
     const { nodes } = get();
     const opCount = nodes.filter((n) => n.op !== 'source' && n.op !== 'output').length;
-    const node = createOpNode(op, position ?? { x: 120 + opCount * 60, y: 40 + (opCount % 4) * 70 });
+    // Default stagger stacks vertically (top-to-bottom chain); callers that
+    // splice into the chain pass an explicit position instead.
+    const node = createOpNode(
+      op,
+      position ?? { x: NODE_CHAIN_X, y: NODE_CHAIN_TOP_Y + NODE_CHAIN_STEP_Y * (opCount + 1) },
+    );
     set({ nodes: [...nodes, node] });
     return node;
   },

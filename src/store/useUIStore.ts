@@ -3,7 +3,7 @@ import { ImageFile, LibraryViewMode, Panel, UiVisibility, CullingSuggestions } f
 
 const RIGHT_PANEL_ORDER = [
   Panel.Metadata,
-  Panel.Adjustments,
+  Panel.Graph,
   Panel.Crop,
   Panel.Masks,
   Panel.Ai,
@@ -91,9 +91,6 @@ interface UIState {
   bottomPanelHeight: number;
   compactEditorPanelHeightOverride: number | null;
 
-  // Node Graph Editor
-  isNodeEditorVisible: boolean;
-
   // Right Panel
   activeRightPanel: Panel | null;
   renderedRightPanel: Panel | null;
@@ -147,10 +144,8 @@ export const useUIStore = create<UIState>((set, get) => ({
   bottomPanelHeight: 144,
   compactEditorPanelHeightOverride: null,
 
-  isNodeEditorVisible: false,
-
-  activeRightPanel: Panel.Adjustments,
-  renderedRightPanel: Panel.Adjustments,
+  activeRightPanel: Panel.Graph,
+  renderedRightPanel: Panel.Graph,
   slideDirection: 1,
   collapsibleSectionsState: { basic: true, color: false, curves: true, details: false, effects: false },
 

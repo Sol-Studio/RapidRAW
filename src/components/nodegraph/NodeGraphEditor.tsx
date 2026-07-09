@@ -5,11 +5,8 @@ import {
   Connection,
   Edge,
   EdgeChange,
-  Handle,
   Node,
   NodeChange,
-  NodeProps,
-  Position,
   ReactFlow,
   ReactFlowInstance,
   ReactFlowProvider,
@@ -17,21 +14,23 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import throttle from 'lodash.throttle';
-import { Plus, Power, Trash2 } from 'lucide-react';
+import { Plus } from 'lucide-react';
 
 import { Adjustments } from '../../utils/adjustments';
+import { GraphEdge, NodeOpType, OUTPUT_NODE_ID, SOURCE_NODE_ID } from '../../types/nodeGraph';
 import {
-  GraphEdge,
-  GraphNode,
-  NODE_OP_DEFINITIONS,
-  NODE_OP_TYPES,
-  NodeOpType,
-  OUTPUT_NODE_ID,
-  SOURCE_NODE_ID,
-} from '../../types/nodeGraph';
-import { flattenNodePipeline, serializeNodePipeline } from '../../utils/nodeGraph';
+  NODE_CHAIN_STEP_Y,
+  NODE_CHAIN_TOP_Y,
+  NODE_CHAIN_X,
+  flattenNodePipeline,
+  serializeNodePipeline,
+} from '../../utils/nodeGraph';
 import { useNodeGraphStore } from '../../store/useNodeGraphStore';
 import { useEditorStore } from '../../store/useEditorStore';
+import { useEditorActions } from '../../hooks/useEditorActions';
+import OpNode from './node/OpNode';
+import TerminalNode from './node/TerminalNode';
+import { NODE_OP_TYPES, NODE_REGISTRY } from './node/registry';
 
 /**
  * Throttle window for IPC-triggering commits while sliders move or nodes are
@@ -39,92 +38,12 @@ import { useEditorStore } from '../../store/useEditorStore';
  */
 const COMMIT_THROTTLE_MS = 30;
 
-interface OpNodeData {
-  graphNode: GraphNode;
-  onValueChange: (id: string, key: string, value: number, dragging: boolean) => void;
-  onToggle: (id: string, enabled: boolean) => void;
-  onDelete: (id: string) => void;
-  [key: string]: unknown;
-}
-
-type OpFlowNode = Node<OpNodeData, 'op'>;
-
-function OpNode({ id, data }: NodeProps<OpFlowNode>) {
-  const { graphNode, onValueChange, onToggle, onDelete } = data;
-  const def = NODE_OP_DEFINITIONS[graphNode.op as NodeOpType];
-  if (!def) return null;
-
-  return (
-    <div
-      className={`rounded-md border text-xs shadow-md min-w-44 bg-bg-secondary ${
-        graphNode.enabled ? 'border-accent/60' : 'border-white/10 opacity-60'
-      }`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-accent !w-2 !h-2" />
-      <div className="flex items-center justify-between gap-2 px-2 py-1.5 border-b border-white/10">
-        <span className="font-medium text-text-primary">{def.label}</span>
-        <div className="flex items-center gap-1">
-          <button
-            className={`nodrag p-0.5 rounded hover:bg-white/10 ${graphNode.enabled ? 'text-accent' : 'text-text-secondary'}`}
-            onClick={() => onToggle(id, !graphNode.enabled)}
-            title="Toggle node"
-          >
-            <Power size={12} />
-          </button>
-          <button
-            className="nodrag p-0.5 rounded hover:bg-white/10 text-text-secondary hover:text-red-400"
-            onClick={() => onDelete(id)}
-            title="Delete node"
-          >
-            <Trash2 size={12} />
-          </button>
-        </div>
-      </div>
-      <div className="px-2 py-1.5 flex flex-col gap-1">
-        {def.params.map((param) => (
-          <label key={param.key} className="flex items-center gap-2">
-            <span className="w-16 shrink-0 text-text-secondary truncate">{param.label}</span>
-            <input
-              type="range"
-              className="nodrag flex-1 h-1 accent-current text-accent"
-              min={param.min}
-              max={param.max}
-              step={param.step}
-              value={graphNode.values[param.key] ?? param.defaultValue}
-              onPointerDown={() => onValueChange(id, param.key, graphNode.values[param.key] ?? param.defaultValue, true)}
-              onChange={(e) => onValueChange(id, param.key, Number(e.target.value), true)}
-              onPointerUp={(e) => onValueChange(id, param.key, Number((e.target as HTMLInputElement).value), false)}
-              onKeyUp={(e) => onValueChange(id, param.key, Number((e.target as HTMLInputElement).value), false)}
-              onBlur={(e) => onValueChange(id, param.key, Number(e.target.value), false)}
-            />
-            <span className="w-9 shrink-0 text-right text-text-primary tabular-nums">
-              {(graphNode.values[param.key] ?? param.defaultValue).toFixed(param.step < 1 ? 2 : 0)}
-            </span>
-          </label>
-        ))}
-      </div>
-      <Handle type="source" position={Position.Right} className="!bg-accent !w-2 !h-2" />
-    </div>
-  );
-}
-
-function TerminalNode({ data }: NodeProps<Node<{ label: string; kind: 'source' | 'output' }, 'terminal'>>) {
-  return (
-    <div className="rounded-full border border-accent/60 bg-bg-secondary px-4 py-2 text-xs font-medium text-text-primary shadow-md">
-      {data.kind === 'output' && <Handle type="target" position={Position.Left} className="!bg-accent !w-2 !h-2" />}
-      {data.label}
-      {data.kind === 'source' && <Handle type="source" position={Position.Right} className="!bg-accent !w-2 !h-2" />}
-    </div>
-  );
-}
-
 const nodeTypes = { op: OpNode, terminal: TerminalNode };
 
-interface NodeGraphEditorProps {
-  setAdjustments: (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)) => void;
-}
-
-export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps) {
+// The graph is the primary pixel editor and lives in the right-panel Graph tab,
+// so it sources `setAdjustments` itself rather than receiving it as a prop.
+export default function NodeGraphEditor() {
+  const { setAdjustments } = useEditorActions();
   const nodes = useNodeGraphStore((s) => s.nodes);
   const edges = useNodeGraphStore((s) => s.edges);
   const setNodes = useNodeGraphStore((s) => s.setNodes);
@@ -198,6 +117,17 @@ export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps
     [updateNodeValues, setEditor, throttledCommit],
   );
 
+  // Merge several values at once (structured node state such as curve points).
+  const handleValuesChange = useCallback(
+    (id: string, values: Record<string, unknown>, dragging: boolean) => {
+      updateNodeValues(id, values);
+      setEditor({ isSliderDragging: dragging });
+      throttledCommit();
+      if (!dragging) throttledCommit.flush();
+    },
+    [updateNodeValues, setEditor, throttledCommit],
+  );
+
   const handleToggle = useCallback(
     (id: string, enabled: boolean) => {
       setNodeEnabled(id, enabled);
@@ -233,16 +163,17 @@ export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps
           data: {
             graphNode: n,
             onValueChange: handleValueChange,
+            onValuesChange: handleValuesChange,
             onToggle: handleToggle,
             onDelete: handleDelete,
           },
         } satisfies Node;
       }),
-    [nodes, handleValueChange, handleToggle, handleDelete],
+    [nodes, handleValueChange, handleValuesChange, handleToggle, handleDelete],
   );
 
   const flowEdges = useMemo<Edge[]>(
-    () => edges.map((e) => ({ id: e.id, source: e.source, target: e.target, animated: true })),
+    () => edges.map((e) => ({ id: e.id, source: e.source, target: e.target, animated: true, type: 'smoothstep' })),
     [edges],
   );
 
@@ -300,10 +231,15 @@ export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps
 
   const handleAddNode = useCallback(
     (op: NodeOpType) => {
-      const node = addOpNode(op);
-      // Auto-splice the new node into the chain before the output node.
-      const { edges: currentEdges } = useNodeGraphStore.getState();
+      // Splice the new node into the vertical chain: place it one step below the
+      // node currently feeding the output, then push the output terminal down.
+      const { nodes: currentNodes, edges: currentEdges } = useNodeGraphStore.getState();
       const intoOutput = currentEdges.filter((e) => e.target === OUTPUT_NODE_ID);
+      const predId = intoOutput.length === 1 ? intoOutput[0].source : SOURCE_NODE_ID;
+      const predNode = currentNodes.find((n) => n.id === predId);
+      const y = (predNode?.position.y ?? NODE_CHAIN_TOP_Y) + NODE_CHAIN_STEP_Y;
+      const node = addOpNode(op, { x: NODE_CHAIN_X, y });
+
       if (intoOutput.length === 1) {
         const prev = intoOutput[0];
         useNodeGraphStore.getState().disconnect(prev.id);
@@ -313,9 +249,18 @@ export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps
         connect(SOURCE_NODE_ID, node.id);
         connect(node.id, OUTPUT_NODE_ID);
       }
+
+      const after = useNodeGraphStore.getState().nodes;
+      setNodes(
+        after.map((n) =>
+          n.id === OUTPUT_NODE_ID && n.position.y <= y
+            ? { ...n, position: { ...n.position, y: y + NODE_CHAIN_STEP_Y } }
+            : n,
+        ),
+      );
       commitGraph();
     },
-    [addOpNode, connect, commitGraph],
+    [addOpNode, connect, commitGraph, setNodes],
   );
 
   return (
@@ -328,10 +273,10 @@ export default function NodeGraphEditor({ setAdjustments }: NodeGraphEditorProps
               key={op}
               onClick={() => handleAddNode(op)}
               className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-white/5 hover:bg-accent/30 text-text-secondary hover:text-text-primary transition-colors"
-              title={`Add ${NODE_OP_DEFINITIONS[op].label} node`}
+              title={`Add ${NODE_REGISTRY[op].label} node`}
             >
               <Plus size={10} />
-              {NODE_OP_DEFINITIONS[op].label}
+              {NODE_REGISTRY[op].label}
             </button>
           ))}
         </div>

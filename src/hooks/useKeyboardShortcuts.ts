@@ -268,7 +268,7 @@ export const useKeyboardShortcuts = ({
         shouldFire: (s: any) => !!s.editor.selectedImage,
         execute: (e: any, s: any) => {
           e.preventDefault();
-          s.ui.setRightPanel(Panel.Adjustments);
+          s.ui.setRightPanel(Panel.Graph);
         },
       },
       toggle_crop_panel: {
@@ -460,7 +460,7 @@ export const useKeyboardShortcuts = ({
           else if (s.editor.activeAiPatchContainerId) s.editor.setEditor({ activeAiPatchContainerId: null });
           else if (s.editor.activeMaskId) s.editor.setEditor({ activeMaskId: null });
           else if (s.editor.activeMaskContainerId) s.editor.setEditor({ activeMaskContainerId: null });
-          else if (s.ui.activeRightPanel === Panel.Crop) s.ui.setRightPanel(Panel.Adjustments);
+          else if (s.ui.activeRightPanel === Panel.Crop) s.ui.setRightPanel(Panel.Graph);
           else if (s.ui.isFullScreen) handleToggleFullScreen();
           else if (s.editor.selectedImage) handleBackToLibrary();
         },

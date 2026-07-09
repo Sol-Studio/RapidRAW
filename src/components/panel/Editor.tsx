@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, useImperativeHandle } from 'react';
 import { Crop, PercentCrop } from 'react-image-crop';
-import { Loader2, Workflow } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
@@ -20,7 +20,6 @@ import { useSettingsStore } from '../../store/useSettingsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useLibraryStore } from '../../store/useLibraryStore';
 import { useAiMasking } from '../../hooks/useAiMasking';
-import NodeGraphEditor from '../nodegraph/NodeGraphEditor';
 
 const parseRgb = (rgbStr: string): [number, number, number, number] => {
   const match = rgbStr.match(/[\d.]+/g);
@@ -80,7 +79,6 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
   const appSettings = useSettingsStore((s) => s.appSettings);
   const osPlatform = useSettingsStore((s) => s.osPlatform);
   const isFullScreen = useUIStore((s) => s.isFullScreen);
-  const isNodeEditorVisible = useUIStore((s) => s.isNodeEditorVisible);
   const activeRightPanel = useUIStore((s) => s.activeRightPanel);
   const isInstantTransition = useUIStore((s) => s.isInstantTransition);
   const setUI = useUIStore((s) => s.setUI);
@@ -2047,36 +2045,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
             hasRenderedFirstFrame={hasRenderedFirstFrame}
           />
         </div>
-
-        <button
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            // Stop the click from bubbling to the canvas container, whose onClick
-            // is the click-to-zoom handler — otherwise toggling the editor also
-            // zooms the preview.
-            e.stopPropagation();
-            setUI((s) => ({ isNodeEditorVisible: !s.isNodeEditorVisible }));
-          }}
-          className={clsx(
-            'absolute bottom-3 right-3 z-40 p-2 rounded-full shadow-lg transition-colors',
-            isNodeEditorVisible
-              ? 'bg-accent text-button-text'
-              : 'bg-bg-secondary/80 text-text-secondary hover:text-text-primary',
-          )}
-          title="Toggle node pipeline editor"
-        >
-          <Workflow size={18} />
-        </button>
       </div>
-
-      {isNodeEditorVisible && !isFullScreen && (
-        // relative + z-20 lifts this panel above the canvas container's
-        // `ring-[9999px]` mask, which (being a positioned sibling) would
-        // otherwise paint its bg-secondary ring over the whole panel.
-        <div className="relative z-20 shrink-0 h-72 rounded-lg overflow-hidden border border-white/10 bg-bg-secondary">
-          <NodeGraphEditor setAdjustments={setAdjustments} />
-        </div>
-      )}
     </div>
   );
 }

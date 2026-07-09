@@ -21,12 +21,29 @@ export type NodeOpType =
   | 'saturation'
   | 'vibrance'
   | 'hue'
+  | 'curves'
   | 'details'
   | 'dehaze'
   | 'effects';
 
+/**
+ * A node's parameter bag. Most ops store plain numbers keyed by their param
+ * (`exposure`, `contrast`, …), but richer nodes store structured adjustment
+ * values under standard keys the backend already understands — e.g. a Tone
+ * Curve node stores `{ curves: {...}, curveMode: 'point' }`. The backend runs
+ * each node's `values` through `get_all_adjustments_from_json`, so any standard
+ * adjustment key is valid here.
+ */
+export type NodeValues = Record<string, unknown>;
+
 export type GraphNodeKind = NodeOpType | 'source' | 'output';
 
+/**
+ * A single numeric parameter an op contributes to the pipeline. The concrete
+ * per-op parameter lists and their UI now live in the node modules under
+ * `src/components/nodegraph/node/[op].tsx`, aggregated by that folder's
+ * registry; this stays here as the shared shape.
+ */
 export interface NodeParamSpec {
   key: string;
   label: string;
@@ -36,77 +53,13 @@ export interface NodeParamSpec {
   defaultValue: number;
 }
 
-export interface NodeOpDefinition {
-  op: NodeOpType;
-  label: string;
-  params: NodeParamSpec[];
-}
-
-const p = (key: string, label: string, min = -100, max = 100, step = 1, defaultValue = 0): NodeParamSpec => ({
-  key,
-  label,
-  min,
-  max,
-  step,
-  defaultValue,
-});
-
-export const NODE_OP_DEFINITIONS: Record<NodeOpType, NodeOpDefinition> = {
-  exposure: { op: 'exposure', label: 'Exposure', params: [p('exposure', 'Exposure', -5, 5, 0.01)] },
-  brightness: { op: 'brightness', label: 'Brightness', params: [p('brightness', 'Brightness', -5, 5, 0.01)] },
-  contrast: { op: 'contrast', label: 'Contrast', params: [p('contrast', 'Contrast')] },
-  tone: {
-    op: 'tone',
-    label: 'Tone',
-    params: [
-      p('highlights', 'Highlights'),
-      p('shadows', 'Shadows'),
-      p('whites', 'Whites'),
-      p('blacks', 'Blacks'),
-    ],
-  },
-  whiteBalance: {
-    op: 'whiteBalance',
-    label: 'White Balance',
-    params: [p('temperature', 'Temperature'), p('tint', 'Tint')],
-  },
-  saturation: { op: 'saturation', label: 'Saturation', params: [p('saturation', 'Saturation')] },
-  vibrance: { op: 'vibrance', label: 'Vibrance', params: [p('vibrance', 'Vibrance')] },
-  hue: { op: 'hue', label: 'Hue', params: [p('hue', 'Hue', -180, 180)] },
-  details: {
-    op: 'details',
-    label: 'Details',
-    params: [
-      p('sharpness', 'Sharpness'),
-      p('clarity', 'Clarity'),
-      p('structure', 'Structure'),
-      p('lumaNoiseReduction', 'Luma NR', 0, 100),
-      p('colorNoiseReduction', 'Color NR', 0, 100),
-    ],
-  },
-  dehaze: { op: 'dehaze', label: 'Dehaze', params: [p('dehaze', 'Dehaze')] },
-  effects: {
-    op: 'effects',
-    label: 'Effects',
-    params: [
-      p('vignetteAmount', 'Vignette'),
-      p('grainAmount', 'Grain', 0, 100),
-      p('glowAmount', 'Glow', 0, 100),
-      p('halationAmount', 'Halation', 0, 100),
-      p('flareAmount', 'Flare', 0, 100),
-    ],
-  },
-};
-
-export const NODE_OP_TYPES = Object.keys(NODE_OP_DEFINITIONS) as NodeOpType[];
-
 /** A node of the editing DAG. Structure is kept React Flow-compatible. */
 export interface GraphNode {
   id: string;
   op: GraphNodeKind;
   position: { x: number; y: number };
   enabled: boolean;
-  values: Record<string, number>;
+  values: NodeValues;
 }
 
 export interface GraphEdge {
@@ -119,7 +72,7 @@ export interface GraphEdge {
 export interface NodePipelineEntry {
   op: NodeOpType;
   enabled: boolean;
-  values: Record<string, number>;
+  values: NodeValues;
 }
 
 export interface NodeGraphData {

@@ -7,7 +7,7 @@ import Editor from '../panel/Editor';
 import BottomBar from '../panel/BottomBar';
 import RightPanelSwitcher from '../panel/right/RightPanelSwitcher';
 import Resizer from '../ui/Resizer';
-import Controls from '../panel/right/ControlsPanel';
+import NodeGraphEditor from '../nodegraph/NodeGraphEditor';
 import MetadataPanel from '../panel/right/MetadataPanel';
 import CropPanel from '../panel/right/CropPanel';
 import MasksPanel from '../panel/right/MasksPanel';
@@ -213,10 +213,10 @@ export default function EditorView({
           key={renderedRightPanel}
           variants={panelVariants}
         >
-          {renderedRightPanel === Panel.Adjustments && <Controls />}
-          {renderedRightPanel === Panel.Metadata && <MetadataPanel />}
+          {renderedRightPanel === Panel.Graph && <NodeGraphEditor />}
           {renderedRightPanel === Panel.Crop && <CropPanel />}
           {renderedRightPanel === Panel.Masks && <MasksPanel />}
+          {renderedRightPanel === Panel.Metadata && <MetadataPanel />}
           {renderedRightPanel === Panel.Presets && (
             <PresetsPanel
               onNavigateToCommunity={() => {
@@ -282,8 +282,7 @@ export default function EditorView({
                 activePanel={activeRightPanel}
                 onPanelSelect={handleRightPanelSelect}
                 isInstantTransition={isInstantTransition}
-                layout="horizontal"
-              />
+                layout="horizontal"              />
             </div>
             <div className="shrink-0 border-t border-surface">{editorBottomBarComponent}</div>
           </>
